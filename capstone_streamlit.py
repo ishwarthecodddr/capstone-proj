@@ -23,6 +23,11 @@ load_dotenv()
 if "GROQ_API_KEY" in st.secrets and not os.getenv("GROQ_API_KEY"):
     os.environ["GROQ_API_KEY"] = st.secrets["GROQ_API_KEY"]
 
+if not os.getenv("GROQ_API_KEY"):
+    st.warning(
+        "GROQ_API_KEY is missing. Set it in Streamlit Secrets for cloud deployment or in .env for local runs."
+    )
+
 DOMAIN_NAME = "Code Review Agent"
 DOMAIN_DESCRIPTION = (
     "An assistant for developers that reviews code-related questions for bugs, security, "
@@ -422,8 +427,23 @@ if prompt := st.chat_input("Ask something..."):
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             config = {"configurable": {"thread_id": st.session_state.thread_id}}
-            result = agent_app.invoke({"question": prompt}, config=config)
-            answer = result.get("answer", "Sorry, I could not generate an answer.")
+            result = {}
+            try:
+                result = agent_app.invoke({"question": prompt}, config=config)
+                answer = result.get("answer", "Sorry, I could not generate an answer.")
+            except Exception as e:
+                err_text = f"{e.__class__.__name__}: {e}"
+                if "authentication" in err_text.lower() or "api_key" in err_text.lower():
+                    st.error(
+                        "Groq authentication failed. Update GROQ_API_KEY in Streamlit Secrets, then redeploy/restart the app."
+                    )
+                    answer = (
+                        "I cannot answer right now because the LLM key is invalid or missing. "
+                        "Please update GROQ_API_KEY in deployment secrets."
+                    )
+                else:
+                    st.error(f"Agent runtime error: {err_text}")
+                    answer = "I encountered a runtime error while processing your request. Please try again."
         st.write(answer)
         faith = result.get("faithfulness", 0.0)
         if faith > 0:
