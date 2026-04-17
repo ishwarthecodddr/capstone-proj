@@ -7,7 +7,7 @@ import os
 import uuid
 from typing import List, TypedDict
 
-import chromadb
+import numpy as np
 import streamlit as st
 from ddgs import DDGS
 from dotenv import load_dotenv
@@ -85,6 +85,15 @@ DOCUMENTS = [
 FAITHFULNESS_THRESHOLD = 0.7
 MAX_EVAL_RETRIES = 2
 
+# Globals initialized in load_agent() and consumed by nodes.
+llm = None
+embedder = None
+collection = None
+retriever_mode = "local"
+doc_texts = []
+doc_topics = []
+doc_embeddings = None
+
 
 class CapstoneState(TypedDict):
     question: str
@@ -160,10 +169,18 @@ Reply with only one word: retrieve / memory_only / tool"""
 
 
 def retrieval_node(state: CapstoneState) -> dict:
-    q_emb = embedder.encode([state["question"]]).tolist()
-    results = collection.query(query_embeddings=q_emb, n_results=3)
-    chunks = results["documents"][0]
-    topics = [m["topic"] for m in results["metadatas"][0]]
+    q_vec = embedder.encode([state["question"]], normalize_embeddings=True)[0]
+
+    if retriever_mode == "chroma" and collection is not None:
+        results = collection.query(query_embeddings=[q_vec.tolist()], n_results=3)
+        chunks = results["documents"][0]
+        topics = [m["topic"] for m in results["metadatas"][0]]
+    else:
+        sims = np.dot(doc_embeddings, q_vec)
+        top_idx = np.argsort(sims)[::-1][:3]
+        chunks = [doc_texts[i] for i in top_idx]
+        topics = [doc_topics[i] for i in top_idx]
+
     context = "\n\n---\n\n".join(f"[{topics[i]}]\n{chunks[i]}" for i in range(len(chunks)))
     return {"retrieved": context, "sources": topics}
 
@@ -297,26 +314,44 @@ def load_agent():
     llm_local = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
     embedder_local = SentenceTransformer("all-MiniLM-L6-v2")
 
-    client_local = chromadb.Client()
-    try:
-        client_local.delete_collection("capstone_kb")
-    except Exception:
-        pass
-    collection_local = client_local.create_collection("capstone_kb")
-
-    texts = [d["text"] for d in DOCUMENTS]
-    collection_local.add(
-        documents=texts,
-        embeddings=embedder_local.encode(texts).tolist(),
-        ids=[d["id"] for d in DOCUMENTS],
-        metadatas=[{"topic": d["topic"]} for d in DOCUMENTS],
+    texts_local = [d["text"] for d in DOCUMENTS]
+    topics_local = [d["topic"] for d in DOCUMENTS]
+    embeddings_local = np.array(
+        embedder_local.encode(texts_local, normalize_embeddings=True),
+        dtype=np.float32,
     )
 
+    collection_local = None
+    retriever_mode_local = "local"
+    try:
+        import chromadb
+
+        client_local = chromadb.Client()
+        try:
+            client_local.delete_collection("capstone_kb")
+        except Exception:
+            pass
+        collection_local = client_local.create_collection("capstone_kb")
+        collection_local.add(
+            documents=texts_local,
+            embeddings=embeddings_local.tolist(),
+            ids=[d["id"] for d in DOCUMENTS],
+            metadatas=[{"topic": d["topic"]} for d in DOCUMENTS],
+        )
+        retriever_mode_local = "chroma"
+    except Exception:
+        # Cloud environments can fail importing chromadb due to protobuf/opentelemetry constraints.
+        retriever_mode_local = "local"
+
     # Bind globals consumed by node functions.
-    global llm, embedder, collection
+    global llm, embedder, collection, retriever_mode, doc_texts, doc_topics, doc_embeddings
     llm = llm_local
     embedder = embedder_local
     collection = collection_local
+    retriever_mode = retriever_mode_local
+    doc_texts = texts_local
+    doc_topics = topics_local
+    doc_embeddings = embeddings_local
 
     graph = StateGraph(CapstoneState)
     graph.add_node("memory", memory_node)
@@ -340,12 +375,15 @@ def load_agent():
     graph.add_edge("save", END)
 
     app = graph.compile(checkpointer=MemorySaver())
-    return app, collection_local
+    return app, len(texts_local), retriever_mode_local
 
 
 try:
-    agent_app, collection = load_agent()
-    st.success(f"Knowledge base loaded: {collection.count()} documents")
+    agent_app, kb_count, active_mode = load_agent()
+    if active_mode == "chroma":
+        st.success(f"Knowledge base loaded: {kb_count} documents (ChromaDB)")
+    else:
+        st.warning(f"Knowledge base loaded: {kb_count} documents (in-memory fallback)")
 except Exception as e:
     st.error(f"Failed to load agent: {e}")
     st.stop()
