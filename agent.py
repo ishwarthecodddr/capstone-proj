@@ -4,6 +4,7 @@ from typing import List, TypedDict
 import numpy as np
 from ddgs import DDGS
 from dotenv import load_dotenv
+from groq import Groq
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
 from langgraph.checkpoint.memory import MemorySaver
@@ -73,6 +74,65 @@ DOCUMENTS = [
 
 FAITHFULNESS_THRESHOLD = 0.7
 MAX_EVAL_RETRIES = 2
+DEFAULT_GROQ_MODELS = (
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
+    "qwen/qwen3.6-27b",
+    "qwen/qwen3.8-27b",
+    "llama-3.1-8b-instant",
+    "llama-3.3-70b-versatile",
+)
+
+
+def get_groq_models() -> List[str]:
+    configured = os.getenv("GROQ_MODEL", "").strip()
+    models: List[str] = []
+    if configured:
+        models.append(configured)
+    for model_name in DEFAULT_GROQ_MODELS:
+        if model_name not in models:
+            models.append(model_name)
+    return models
+
+
+def resolve_groq_model() -> str | None:
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    configured = os.getenv("GROQ_MODEL", "").strip()
+    if configured:
+        return configured
+
+    try:
+        client = Groq(api_key=api_key)
+        available = []
+        for model in client.models.list().data:
+            model_id = getattr(model, "id", None) or (model.get("id") if isinstance(model, dict) else None)
+            if model_id:
+                available.append(model_id)
+
+        if available:
+            preferred_order = [
+                "openai/gpt-oss-20b",
+                "openai/gpt-oss-120b",
+                "qwen/qwen3.6-27b",
+                "qwen/qwen3.8-27b",
+                "llama-3.1-8b-instant",
+                "llama-3.3-70b-versatile",
+            ]
+            for candidate in preferred_order:
+                if candidate in available:
+                    return candidate
+            return available[0]
+    except Exception:
+        pass
+
+    for model_name in get_groq_models():
+        if model_name:
+            return model_name
+    return None
+
 
 # Globals initialized in build_agent() and consumed by nodes.
 llm = None
@@ -220,19 +280,29 @@ Use ONLY the provided context.
 If context is insufficient, say exactly:
 I don't have that information in my knowledge base.
 
-When possible, format answer as:
-1) Issue/Risk
-2) Why it matters
-3) Suggested fix
+Rules:
+- Do not reveal chain-of-thought, hidden reasoning, or <think> blocks.
+- Return only the final answer, with no analysis or meta-comments.
+- Keep the response short, clear, and actionable.
+- When possible, format answer as:
+  1) Issue/Risk
+  2) Why it matters
+  3) Suggested fix
 
 Be precise and actionable. Do not invent facts.
 
 {context}"""
     else:
-        system_content = "You are a Code Review Agent. Answer only from conversation history."
+        system_content = """You are a Code Review Agent. Answer only from conversation history.
+
+Rules:
+- Do not reveal chain-of-thought, hidden reasoning, or <think> blocks.
+- Return only the final answer, with no analysis or meta-comments.
+- If there is no project or code context, ask the user for the code or project details in 1-2 sentences.
+- Keep the answer brief and direct."""
 
     if eval_retries > 0:
-        system_content += "\n\nIMPORTANT: Previous answer failed quality check. Stay strictly grounded in context."
+        system_content += "\n\nIMPORTANT: Previous answer failed quality check. Stay strictly grounded in context and do not expose reasoning."
 
     lc_msgs = [SystemMessage(content=system_content)]
     for msg in messages[:-1]:
@@ -294,7 +364,20 @@ def eval_decision(state: CapstoneState) -> str:
 
 
 def build_agent():
-    llm_local = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
+    model_name = resolve_groq_model()
+    if not model_name:
+        raise RuntimeError(
+            "Groq API key is missing or no supported Groq model could be resolved. "
+            "Set GROQ_API_KEY and optionally GROQ_MODEL to a valid Groq model ID."
+        )
+
+    try:
+        llm_local = ChatGroq(model=model_name, temperature=0)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Unable to initialize Groq model '{model_name}'. Set GROQ_MODEL to a supported Groq model ID for this key."
+        ) from exc
+
     embedder_local = SentenceTransformer("all-MiniLM-L6-v2")
 
     texts_local = [d["text"] for d in DOCUMENTS]
